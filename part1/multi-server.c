@@ -7,11 +7,13 @@
 #include <arpa/inet.h>  /* for sockaddr_in and inet_ntoa() */
 #include <stdlib.h>     /* for atoi() and exit() */
 #include <string.h>     /* for memset() */
-#include <unistd.h>     /* for close() */
+#include <unistd.h>     /* for close(), fork() */
 #include <time.h>       /* for time() */
 #include <netdb.h>      /* for gethostbyname() */
 #include <signal.h>     /* for signal() */
 #include <sys/stat.h>   /* for stat() */
+#include <sys/wait.h>   /* for waitpid() */
+
 
 #define MAXPENDING 5    /* Maximum outstanding connection requests */
 
@@ -215,6 +217,16 @@ func_end:
     return statusCode;
 }
 
+static void
+chldHandler(int signo){
+	pid_t pid;
+	
+	while(1){
+		pid = waitpid(-1, NULL, WNOHANG);
+		if(pid <= 0)
+			break;
+	}
+}
 
 
 int main(int argc, char *argv[])
@@ -229,12 +241,16 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
+    if(signal(SIGCHLD, chldHandler) == SIG_ERR)
+	    die("CANNOT INSTALL SIGCHLD HANDLER\n");
+
     unsigned short servPort = atoi(argv[1]);
     const char *webRoot = argv[2];
     fprintf(stderr, "webRoot: %s\n", webRoot);
 
     int servSock = createServerSocket(servPort);
 
+    pid_t pid;
     char line[1000];
     char requestLine[1000];
     int statusCode;
@@ -248,9 +264,24 @@ int main(int argc, char *argv[])
 
         // initialize the in-out parameter
         unsigned int clntLen = sizeof(clntAddr); 
+	// waiting in accept(), continue execution after server accepts an client's request
         int clntSock = accept(servSock, (struct sockaddr *)&clntAddr, &clntLen);
+	//fprintf(stderr, "Hi, finally it's my turn\n");
+	
+	// create a new process to handle the this connection
+	pid = fork();
+
+	if(pid == -1){
+		die("error while creating child process!\n");
+	}else if(pid > 0){
+		goto parent_restart;
+	}
+
         if (clntSock < 0)
             die("accept() failed");
+
+	// here we are in the child process, close the server socket
+	close(servSock);
 
         FILE *clntFp = fdopen(clntSock, "r");
         if (clntFp == NULL)
@@ -363,6 +394,12 @@ loop_end:
 
         // close the client socket 
         fclose(clntFp);
+	exit(1);
+
+parent_restart:
+
+	// close the client socket
+	close(clntSock);
 
     } // for (;;)
 
