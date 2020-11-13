@@ -7,17 +7,30 @@
 #include <arpa/inet.h>  /* for sockaddr_in and inet_ntoa() */
 #include <stdlib.h>     /* for atoi() and exit() */
 #include <string.h>     /* for memset() */
-#include <unistd.h>     /* for close(), fork() */
+#include <unistd.h>     /* for close() */
 #include <time.h>       /* for time() */
 #include <netdb.h>      /* for gethostbyname() */
 #include <signal.h>     /* for signal() */
 #include <sys/stat.h>   /* for stat() */
+#include <semaphore.h> 
 #include <sys/wait.h>   /* for waitpid() */
+#include <sys/mman.h>   /* for mmap() */
 
 
 #define MAXPENDING 5    /* Maximum outstanding connection requests */
 
 #define DISK_IO_BUF_SIZE 4096
+
+struct stats{
+	sem_t semp;
+	unsigned int totalreq;
+	unsigned int req_2xx;
+	unsigned int req_3xx;
+	unsigned int req_4xx;
+	unsigned int req_5xx;
+};
+
+static struct stats *Statistics = NULL;
 
 static void die(const char *message)
 {
@@ -140,9 +153,52 @@ static void sendStatusLine(int clntSock, int statusCode)
         strcat(buf, body);
     }
 
+    // lock the semaphore
+    sem_wait(&Statistics->semp);
+    
+    // update Statistics
+    Statistics->totalreq++;
+    if(statusCode >= 200 && statusCode < 300){
+	    Statistics->req_2xx++;
+    }else if(statusCode >= 300 && statusCode < 400){
+	    Statistics->req_3xx++;
+    }else if(statusCode >= 400 && statusCode < 500){
+	    Statistics->req_4xx++;
+    }else if(statusCode >= 500 && statusCode < 600){
+	    Statistics->req_5xx++;
+    }
+    
+    // unlock the semaphore
+    sem_post(&Statistics->semp);
+
     // send the buffer to the browser
     Send(clntSock, buf);
 }
+
+// Handle the Statistics requests
+static int
+handleStatRequest(int clntSock){
+	static char buf[4096];
+
+	sendStatusLine(clntSock, 200);
+
+	sem_wait(&Statistics->semp);
+
+	snprintf(buf, sizeof(buf), "<html><body>\n"
+			"<h1>Server Statistics</h1>\n"
+			"<tr><td>total requests: </td><td>%d</td></tr>\n"
+			"<tr><td>2xx requests: </td><td>%d</td></tr>\n"
+			"<tr><td>3xx requests: </td><td>%d</td></tr>\n"
+			"<tr><td>4xx requests: </td><td>%d</td></tr>\n"
+			"<tr><td>5xx requests: </td><td>%d</td></tr>\n"
+			"</body></html>\n",/*" the total request: %d",*/
+			Statistics->totalreq, Statistics->req_2xx, Statistics->req_3xx, Statistics->req_4xx, Statistics->req_5xx);
+	sem_post(&Statistics->semp);
+
+	Send(clntSock, buf);
+	return 200;
+}
+
 
 /*
  * Handle static file requests.
@@ -223,20 +279,21 @@ chldHandler(int signo){
 }
 
 
+
 int main(int argc, char *argv[])
 {
     // Ignore SIGPIPE so that we don't terminate when we call
     // send() on a disconnected socket.
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
-        die("signal() failed");
+        die("signal() failed\n");
+
+    if (signal(SIGCHLD, chldHandler) == SIG_ERR)
+	    die("chldHandler failed\n");
 
     if (argc != 3) {
         fprintf(stderr, "usage: %s <server_port> <web_root>\n", argv[0]);
         exit(1);
     }
-
-    if(signal(SIGCHLD, chldHandler) == SIG_ERR)
-	    die("CANNOT INSTALL SIGCHLD HANDLER\n");
 
     unsigned short servPort = atoi(argv[1]);
     const char *webRoot = argv[2];
@@ -244,38 +301,50 @@ int main(int argc, char *argv[])
 
     int servSock = createServerSocket(servPort);
 
-    pid_t pid;
     char line[1000];
     char requestLine[1000];
     int statusCode;
     struct sockaddr_in clntAddr;
+    pid_t pid;
+
+    // anonymous memory mapping
+    if((Statistics = mmap(0, sizeof(struct stats), PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0)) == MAP_FAILED)
+	    die("anonymous memory mapping failed\n");
+    // allocate a memory segment to Statistics
+    //if((Statistics = malloc(sizeof(struct stats))) == NULL)
+	    //die("memory allocation to Statistics failed!\n");
+
+    memset(Statistics, 0, sizeof(struct stats));
+
+    // create an unnamed semaphore
+    if(sem_init(&Statistics->semp, 1, 1) != 0)
+	    die(" semaphore initialization failed \n");
 
     for (;;) {
 
         /*
          * wait for a client to connect
          */
+	
+	fprintf(stderr, "the total requests is : %d\n", Statistics->totalreq);
 
         // initialize the in-out parameter
         unsigned int clntLen = sizeof(clntAddr); 
-	// waiting in accept(), continue execution after server accepts an client's request
         int clntSock = accept(servSock, (struct sockaddr *)&clntAddr, &clntLen);
-	//fprintf(stderr, "Hi, finally it's my turn\n");
-	
-	// create a new process to handle the this connection
-	pid = fork();
-
-	if(pid == -1){
-		die("error while creating child process!\n");
-	}else if(pid > 0){
-		goto parent_restart;
-	}
-
         if (clntSock < 0)
             die("accept() failed");
+	
+	// create a new process - child process
+	pid = fork();
+	if (pid == -1){
+		die("fork failed\n");
+	}else if(pid > 0){
+		close(clntSock);
+		continue;
+	}
 
-	// here we are in the child process, close the server socket
 	close(servSock);
+
 
         FILE *clntFp = fdopen(clntSock, "r");
         if (clntFp == NULL)
@@ -367,8 +436,12 @@ int main(int argc, char *argv[])
          * At this point, we have a well-formed HTTP GET request.
          * Let's handle it.
          */
-
+	if (strcmp(requestURI,"/Statistics") == 0){
+		statusCode = handleStatRequest(clntSock);
+	}
+	else{
         statusCode = handleFileRequest(webRoot, requestURI, clntSock);
+	}
 
 loop_end:
 
@@ -388,14 +461,15 @@ loop_end:
 
         // close the client socket 
         fclose(clntFp);
+
+	//fprintf(stderr, " the total request: %d \n", Statistics->totalreq);
+
 	exit(1);
 
-parent_restart:
-
-	// close the client socket
-	close(clntSock);
-
     } // for (;;)
+
+    sem_destroy(&Statistics->semp);
+    munmap(Statistics, sizeof(struct stats));
 
     return 0;
 }
